@@ -126,6 +126,54 @@ jobs:
           (logs / "sdl-build-fixes.patch").write_text("".join(diffs), encoding="utf-8")
           print("All three SDL files patched; conditional directives are balanced.")
 
+      - name: Patch SDL callback typedef conflict
+        shell: python {0}
+        run: |
+          # Build-local fix for the pinned SDL3-UWP revision.
+          # SDL_dynapi.c already includes SDL_video_unsupported.h before its API table.
+          # Keep that header's real function-pointer type; remove the stale void* alias.
+          from pathlib import Path
+          import difflib
+          import os
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          sdl = root / "Projects" / "SDL3-uwp"
+          logs = root / "BuildLogs"
+          logs.mkdir(exist_ok=True)
+
+          relative = "src/dynapi/SDL_dynapi_unsupported.h"
+          path = sdl / relative
+          original = path.read_text(encoding="utf-8-sig")
+          old = "#ifndef SDL_PLATFORM_IOS\ntypedef void *SDL_iOSAnimationCallback;\n#endif"
+          new = (
+              "/* Build-local fix: SDL_system.h or SDL_video_unsupported.h provides the\n"
+              " * real SDL_iOSAnimationCallback function-pointer typedef. SDL_dynapi.c\n"
+              " * includes those headers before declaring its API table. */"
+          )
+          if original.count(old) != 1:
+              raise RuntimeError(
+                  "Expected exactly one stale SDL_iOSAnimationCallback typedef. "
+                  "Check that SDL is still pinned to ddd5d4f99a26ac95d4620ccf489c07fcf5f08636."
+              )
+
+          video = (sdl / "src/video/SDL_video_unsupported.h").read_text(encoding="utf-8-sig")
+          callback = "typedef void (SDLCALL *SDL_iOSAnimationCallback)(void *userdata);"
+          if video.count(callback) != 1:
+              raise RuntimeError("The expected real callback typedef is missing; refusing to patch.")
+          unit = (sdl / "src/dynapi/SDL_dynapi.c").read_text(encoding="utf-8-sig")
+          if '#include "../video/SDL_video_unsupported.h"' not in unit:
+              raise RuntimeError("SDL_dynapi.c no longer includes the fallback video header.")
+
+          updated = original.replace(old, new, 1)
+          diff = "".join(difflib.unified_diff(
+              original.splitlines(keepends=True), updated.splitlines(keepends=True),
+              fromfile="a/" + relative, tofile="b/" + relative,
+          ))
+          path.write_text(updated, encoding="utf-8", newline="\n")
+          with (logs / "sdl-build-fixes.patch").open("a", encoding="utf-8", newline="\n") as out:
+              out.write(diff)
+          print("Fixed SDL_iOSAnimationCallback: removed stale void* typedef; kept function-pointer definition.")
+
       - name: Record build environment and source revisions
         shell: pwsh
         run: |
