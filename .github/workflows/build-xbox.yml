@@ -3,6 +3,9 @@ name: Build Cemu UWP for Xbox
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-2025-vs2026
@@ -13,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: Projects/Cemu-UWP-Host
+          persist-credentials: false
 
       - name: Checkout modified Cemu
         uses: actions/checkout@v4
@@ -20,86 +24,190 @@ jobs:
           repository: rodrigoandrigo/Cemu
           path: Projects/Cemu
           submodules: recursive
+          persist-credentials: false
 
       - name: Checkout SDL3 UWP
         uses: actions/checkout@v4
         with:
           repository: SternXD/SDL3-uwp
+          # Pin the exact uwp-3.4.16 revision that the patch below targets.
+          ref: ddd5d4f99a26ac95d4620ccf489c07fcf5f08636
           path: Projects/SDL3-uwp
           submodules: recursive
+          persist-credentials: false
 
-      - name: Show build environment
+      - name: Set up Python for the source patch
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Patch SDL conditional-compilation errors
+        shell: python {0}
+        run: |
+          # Build-local corrections for SternXD/SDL3-uwp at the pinned commit.
+          # These changes only repair conditional-compilation boundaries.
+          from pathlib import Path
+          import difflib
+          import os
+          import re
+
+          root = Path(os.environ["GITHUB_WORKSPACE"])
+          sdl = root / "Projects" / "SDL3-uwp"
+          logs = root / "BuildLogs"
+          logs.mkdir(exist_ok=True)
+
+          edits = {
+              "src/core/windows/SDL_windows.c": [
+                  (
+                      "#endif\n\n// Stub implementations for UWP/Xbox platforms",
+                      "#else\n\n// Stub implementations for UWP/Xbox platforms",
+                  ),
+                  (
+                      "// Sets an error message based on an HRESULT",
+                      "#endif // Desktop helper window versus UWP/Xbox stubs\n\n"
+                      "// Sets an error message based on an HRESULT",
+                  ),
+              ],
+              "src/thread/windows/SDL_sysmutex.c": [
+                  (
+                      "#endif\nstatic pfnInitializeSRWLock pInitializeSRWLock = NULL;",
+                      "static pfnInitializeSRWLock pInitializeSRWLock = NULL;",
+                  ),
+              ],
+              "src/thread/windows/SDL_syssem.c": [
+                  (
+                      "#endif\n#endif\n\nstatic pfnWaitOnAddress pWaitOnAddress = NULL;",
+                      "\nstatic pfnWaitOnAddress pWaitOnAddress = NULL;",
+                  ),
+              ],
+          }
+
+          def check_directives(text: str, name: str) -> None:
+              stack: list[int] = []
+              for number, line in enumerate(text.splitlines(), start=1):
+                  match = re.match(r"^\s*#\s*(if|ifdef|ifndef|else|elif|endif)\b", line)
+                  if match is None:
+                      continue
+                  directive = match.group(1)
+                  if directive in ("if", "ifdef", "ifndef"):
+                      stack.append(number)
+                  elif not stack:
+                      raise RuntimeError(f"{name}:{number}: unmatched #{directive}")
+                  elif directive == "endif":
+                      stack.pop()
+              if stack:
+                  raise RuntimeError(f"{name}: unclosed #if at lines {stack}")
+
+          pending: list[tuple[Path, str]] = []
+          diffs: list[str] = []
+          for relative, replacements in edits.items():
+              path = sdl / relative
+              original = path.read_text(encoding="utf-8-sig")
+              updated = original
+              for old, new in replacements:
+                  count = updated.count(old)
+                  if count != 1:
+                      raise RuntimeError(
+                          f"Refusing to patch {relative}: expected one matching block, found {count}. "
+                          "Check that the SDL checkout uses the pinned commit."
+                      )
+                  updated = updated.replace(old, new, 1)
+              check_directives(updated, relative)
+              pending.append((path, updated))
+              diffs.extend(difflib.unified_diff(
+                  original.splitlines(keepends=True), updated.splitlines(keepends=True),
+                  fromfile="a/" + relative, tofile="b/" + relative,
+              ))
+
+          # Do not modify any files until every expected block has been validated.
+          for path, updated in pending:
+              path.write_text(updated, encoding="utf-8", newline="\n")
+              print(f"Patched {path.relative_to(sdl)}")
+          (logs / "sdl-build-fixes.patch").write_text("".join(diffs), encoding="utf-8")
+          print("All three SDL files patched; conditional directives are balanced.")
+
+      - name: Record build environment and source revisions
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\BuildLogs" | Out-Null
           cmake --version
+          if ($LASTEXITCODE -ne 0) { throw "CMake was not found." }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           & $vswhere -latest -products * -property installationPath
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name
+          foreach ($name in @('Cemu-UWP-Host', 'Cemu', 'SDL3-uwp')) {
+            $revision = git -C "$env:GITHUB_WORKSPACE\Projects\$name" rev-parse HEAD
+            if ($LASTEXITCODE -ne 0) { throw "Cannot read revision for $name." }
+            "$name $revision" | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\BuildLogs\source-revisions.txt" -Append
+          }
 
       - name: Configure Cemu UWP runtime
         shell: pwsh
         run: |
-          $cemu = Resolve-Path "$env:GITHUB_WORKSPACE\Projects\Cemu"
-          $sdl  = Resolve-Path "$env:GITHUB_WORKSPACE\Projects\SDL3-uwp"
-
-          Set-Location $cemu
-
+          $ErrorActionPreference = 'Stop'
+          $cemuDir = "$env:GITHUB_WORKSPACE\Projects\Cemu"
+          $sdlDir = "$env:GITHUB_WORKSPACE\Projects\SDL3-uwp"
+          Set-Location $cemuDir
           cmake -S . -B build-msvc-d3d11 `
             -G "Visual Studio 18 2026" `
             -A x64 `
             -DCEMU_UWP=ON `
             -DENABLE_D3D11=ON `
-            "-DSDL3_UWP_SOURCE_DIR=$sdl"
+            "-DSDL3_UWP_SOURCE_DIR=$sdlDir" `
+            2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\BuildLogs\configure.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cemu configuration failed with exit code $LASTEXITCODE."
+          }
 
       - name: Build Cemu runtime
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           Set-Location "$env:GITHUB_WORKSPACE\Projects\Cemu"
-
           cmake --build build-msvc-d3d11 `
             --config Release `
             --target CemuBin `
-            --parallel
+            --parallel `
+            2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\BuildLogs\runtime-build.log"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Cemu runtime build failed with exit code $LASTEXITCODE."
+          }
 
       - name: Verify Cemu runtime
         shell: pwsh
         run: |
           $bin = "$env:GITHUB_WORKSPACE\Projects\Cemu\bin"
-
-          if (!(Test-Path "$bin\Cemu_release.dll")) {
-            throw "Cemu_release.dll was not produced"
+          foreach ($relative in @(
+            'Cemu_release.dll',
+            'Cemu_release.lib',
+            'resources\sharedFonts\CafeCn.ttf'
+          )) {
+            if (!(Test-Path (Join-Path $bin $relative))) {
+              throw "Required runtime file is missing: $relative"
+            }
           }
-
-          if (!(Test-Path "$bin\Cemu_release.lib")) {
-            throw "Cemu_release.lib was not produced"
-          }
-
-          if (!(Test-Path "$bin\resources\sharedFonts\CafeCn.ttf")) {
-            throw "Required CafeCn.ttf resource is missing"
-          }
-
-          Write-Host "Cemu runtime looks good."
+          Write-Host 'Required Cemu runtime files are present.'
 
       - name: Build Xbox UWP package
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vs = & $vswhere -latest -products * -version "[18.0,19.0)" -property installationPath
+          $vs = & $vswhere -latest -products * -version '[18.0,19.0)' -property installationPath
+          if (!$vs) { throw 'Visual Studio 2026 was not found.' }
+          $msbuild = Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe'
+          if (!(Test-Path $msbuild)) { throw "MSBuild was not found: $msbuild" }
 
-          if (!$vs) {
-            throw "Visual Studio 2026 was not found"
-          }
-
-          $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
-
-          $host = "$env:GITHUB_WORKSPACE\Projects\Cemu-UWP-Host"
+          # $Host is a read-only PowerShell automatic variable. Use $hostDir.
+          $hostDir = "$env:GITHUB_WORKSPACE\Projects\Cemu-UWP-Host"
           $cemuBin = "$env:GITHUB_WORKSPACE\Projects\Cemu\bin"
           $cemuSrc = "$env:GITHUB_WORKSPACE\Projects\Cemu\src"
-          $out = "$env:GITHUB_WORKSPACE\AppxPackages\"
+          $outDir = "$env:GITHUB_WORKSPACE\AppxPackages\"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
+          Set-Location $hostDir
 
-          Set-Location $host
-
-          & $msbuild ".\Cemu-UWP-Host.vcxproj" `
+          & $msbuild '.\Cemu-UWP-Host.vcxproj' `
             /restore `
             /m `
             /t:Rebuild `
@@ -111,18 +219,19 @@ jobs:
             /p:GenerateAppInstallerFile=false `
             /p:AppxBundle=Always `
             /p:AppxBundlePlatforms=x64 `
-            "/p:AppxPackageDir=$out"
-
+            "/p:AppxPackageDir=$outDir" `
+            2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\BuildLogs\host-build.log"
           if ($LASTEXITCODE -ne 0) {
-            throw "MSBuild failed with exit code $LASTEXITCODE"
+            throw "UWP host build failed with exit code $LASTEXITCODE."
           }
 
-      - name: List generated packages
+      - name: Verify generated package
         shell: pwsh
         run: |
-          Write-Host "Generated files:"
-          Get-ChildItem "$env:GITHUB_WORKSPACE\AppxPackages" -Recurse |
-            Select-Object FullName, Length
+          $packages = @(Get-ChildItem "$env:GITHUB_WORKSPACE\AppxPackages" -Recurse -File |
+            Where-Object { $_.Extension -in @('.appx', '.appxbundle', '.msix', '.msixbundle') })
+          if ($packages.Count -eq 0) { throw 'No installable app package was generated.' }
+          $packages | Select-Object FullName, Length
 
       - name: Upload Xbox package
         uses: actions/upload-artifact@v4
@@ -130,3 +239,13 @@ jobs:
           name: Cemu-UWP-Xbox-x64
           path: AppxPackages/**
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cemu-build-logs
+          path: BuildLogs/**
+          if-no-files-found: ignore
+          retention-days: 7
