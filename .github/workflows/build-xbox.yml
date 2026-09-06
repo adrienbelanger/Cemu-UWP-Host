@@ -1,0 +1,132 @@
+name: Build Cemu UWP for Xbox
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Cemu UWP Host
+        uses: actions/checkout@v4
+        with:
+          path: Projects/Cemu-UWP-Host
+
+      - name: Checkout modified Cemu
+        uses: actions/checkout@v4
+        with:
+          repository: rodrigoandrigo/Cemu
+          path: Projects/Cemu
+          submodules: recursive
+
+      - name: Checkout SDL3 UWP
+        uses: actions/checkout@v4
+        with:
+          repository: SternXD/SDL3-uwp
+          path: Projects/SDL3-uwp
+          submodules: recursive
+
+      - name: Show build environment
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -products * -property installationPath
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name
+
+      - name: Configure Cemu UWP runtime
+        shell: pwsh
+        run: |
+          $cemu = Resolve-Path "$env:GITHUB_WORKSPACE\Projects\Cemu"
+          $sdl  = Resolve-Path "$env:GITHUB_WORKSPACE\Projects\SDL3-uwp"
+
+          Set-Location $cemu
+
+          cmake -S . -B build-msvc-d3d11 `
+            -G "Visual Studio 18 2026" `
+            -A x64 `
+            -DCEMU_UWP=ON `
+            -DENABLE_D3D11=ON `
+            "-DSDL3_UWP_SOURCE_DIR=$sdl"
+
+      - name: Build Cemu runtime
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\Projects\Cemu"
+
+          cmake --build build-msvc-d3d11 `
+            --config Release `
+            --target CemuBin `
+            --parallel
+
+      - name: Verify Cemu runtime
+        shell: pwsh
+        run: |
+          $bin = "$env:GITHUB_WORKSPACE\Projects\Cemu\bin"
+
+          if (!(Test-Path "$bin\Cemu_release.dll")) {
+            throw "Cemu_release.dll was not produced"
+          }
+
+          if (!(Test-Path "$bin\Cemu_release.lib")) {
+            throw "Cemu_release.lib was not produced"
+          }
+
+          if (!(Test-Path "$bin\resources\sharedFonts\CafeCn.ttf")) {
+            throw "Required CafeCn.ttf resource is missing"
+          }
+
+          Write-Host "Cemu runtime looks good."
+
+      - name: Build Xbox UWP package
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version "[18.0,19.0)" -property installationPath
+
+          if (!$vs) {
+            throw "Visual Studio 2026 was not found"
+          }
+
+          $msbuild = Join-Path $vs "MSBuild\Current\Bin\MSBuild.exe"
+
+          $host = "$env:GITHUB_WORKSPACE\Projects\Cemu-UWP-Host"
+          $cemuBin = "$env:GITHUB_WORKSPACE\Projects\Cemu\bin"
+          $cemuSrc = "$env:GITHUB_WORKSPACE\Projects\Cemu\src"
+          $out = "$env:GITHUB_WORKSPACE\AppxPackages\"
+
+          Set-Location $host
+
+          & $msbuild ".\Cemu-UWP-Host.vcxproj" `
+            /restore `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            "/p:CemuBuildDir=$cemuBin" `
+            "/p:CemuIncludeDir=$cemuSrc" `
+            /p:GenerateAppxPackageOnBuild=true `
+            /p:GenerateAppInstallerFile=false `
+            /p:AppxBundle=Always `
+            /p:AppxBundlePlatforms=x64 `
+            "/p:AppxPackageDir=$out"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE"
+          }
+
+      - name: List generated packages
+        shell: pwsh
+        run: |
+          Write-Host "Generated files:"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\AppxPackages" -Recurse |
+            Select-Object FullName, Length
+
+      - name: Upload Xbox package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cemu-UWP-Xbox-x64
+          path: AppxPackages/**
+          if-no-files-found: error
